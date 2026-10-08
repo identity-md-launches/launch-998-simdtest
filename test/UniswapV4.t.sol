@@ -127,6 +127,87 @@ contract UniswapV4Test is TestBase {
         assertEq(pair.balanceOf(address(trader)), pairBefore);
     }
 
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_ExactOutputBuyThenSellSettlesInEitherCurrencyOrder(uint256 seed, bool tokenAsZero) public {
+        _prepare(tokenAsZero);
+        uint256 gross = 100 + seed % (1_000_000e18 - 99);
+        uint256 managerBefore = token.balanceOf(MANAGER);
+        uint256 pairBefore = pair.balanceOf(address(trader));
+        BalanceDelta buy = trader.swap(!tokenIsZero, int256(gross), false);
+        int128 tokenDelta = tokenIsZero ? buy.amount0() : buy.amount1();
+        int128 pairDelta = tokenIsZero ? buy.amount1() : buy.amount0();
+        assertTrue(tokenDelta > 0 && pairDelta < 0);
+        assertEq(uint256(int256(tokenDelta)), gross);
+        uint256 bought = gross - gross / 100;
+        assertEq(token.balanceOf(address(trader)), bought);
+        assertEq(token.balanceOf(MANAGER), managerBefore - gross);
+        assertEq(token.totalSupply(), SUPPLY - gross / 100);
+        assertEq(pairBefore - pair.balanceOf(address(trader)), uint256(-int256(pairDelta)));
+
+        BalanceDelta sell = trader.swap(tokenIsZero, -int256(bought), false);
+        int128 soldDelta = tokenIsZero ? sell.amount0() : sell.amount1();
+        assertEq(uint256(-int256(soldDelta)), bought);
+        assertEq(token.balanceOf(address(trader)), 0);
+        assertEq(token.balanceOf(MANAGER), managerBefore - gross / 100);
+        assertEq(token.totalSupply(), SUPPLY - gross / 100);
+        assertEq(token.balanceOf(DISTRIBUTOR), SUPPLY / 10);
+    }
+
+    function test_ExactOutputSellHasNoBurnWithTokenAsCurrency0() public {
+        _prepare(true);
+        _exactOutputSell();
+    }
+
+    function test_ExactOutputSellHasNoBurnWithTokenAsCurrency1() public {
+        _prepare(false);
+        _exactOutputSell();
+    }
+
+    function test_UnderpaidBuyRollsBackAndNextUnlockSucceedsWithTokenAsCurrency1() public {
+        _prepare(false);
+        _assertFailedBuyThenRetry();
+    }
+
+    function test_UnderpaidBuyRollsBackAndNextUnlockSucceedsWithTokenAsCurrency0() public {
+        _prepare(true);
+        _assertFailedBuyThenRetry();
+    }
+
+    function _exactOutputSell() private {
+        trader.swap(!tokenIsZero, -0.01 ether, false);
+        uint256 held = token.balanceOf(address(trader));
+        uint256 managerBefore = token.balanceOf(MANAGER);
+        uint256 supplyBefore = token.totalSupply();
+        uint256 pairBefore = pair.balanceOf(address(trader));
+        uint256 requestedPair = 0.001 ether;
+        BalanceDelta sell = trader.swap(tokenIsZero, int256(requestedPair), false);
+        int128 input = tokenIsZero ? sell.amount0() : sell.amount1();
+        int128 output = tokenIsZero ? sell.amount1() : sell.amount0();
+        assertTrue(input < 0 && output > 0);
+        uint256 sold = uint256(-int256(input));
+        assertTrue(sold > 0 && sold < held);
+        assertEq(uint256(int256(output)), requestedPair);
+        assertEq(pair.balanceOf(address(trader)), pairBefore + requestedPair);
+        assertEq(token.balanceOf(address(trader)), held - sold);
+        assertEq(token.balanceOf(MANAGER), managerBefore + sold);
+        assertEq(token.totalSupply(), supplyBefore);
+    }
+
+    function _assertFailedBuyThenRetry() private {
+        uint256 managerBefore = token.balanceOf(MANAGER);
+        uint256 pairManagerBefore = pair.balanceOf(MANAGER);
+        uint256 pairTraderBefore = pair.balanceOf(address(trader));
+        vm.expectRevert(abi.encodeWithSelector(IPoolManager.CurrencyNotSettled.selector));
+        trader.swap(!tokenIsZero, -0.01 ether, true);
+        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(token.balanceOf(MANAGER), managerBefore);
+        assertEq(token.balanceOf(address(trader)), 0);
+        assertEq(pair.balanceOf(MANAGER), pairManagerBefore);
+        assertEq(pair.balanceOf(address(trader)), pairTraderBefore);
+        // Reusing the pool also detects an unlock/delta left poisoned by the reverted buy.
+        _roundTrip();
+    }
+
     function _prepare(bool tokenAsZero) private {
         vm.chainId(1);
         // Execute the manager constructor at the pinned address to preserve NoDelegateCall's immutable.
